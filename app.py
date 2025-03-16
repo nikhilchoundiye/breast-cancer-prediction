@@ -12,7 +12,7 @@ import time
 import requests
 import json 
 # Backend API URL
-API_URL = "http://127.0.0.1:8000/api/validate_license/"
+API_URL = "https://your-railway-app-url.onrailway.app/api/validate_license/"
 
 # Streamlit UI for License Verification
 def verify_license():
