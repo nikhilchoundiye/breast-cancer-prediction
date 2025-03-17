@@ -9,3 +9,5 @@ streamlit==1.43.2
 plotly==6.0.0
 fpdf==1.7.2
 gunicorn
+Django>=5.1.7
+djangorestframework
