@@ -8,6 +8,6 @@ seaborn==0.13.2
 streamlit==1.43.2
 plotly==6.0.0
 fpdf==1.7.2
-gunicorn
+waitress==2.1.2
 Django>=5.1.7
 djangorestframework
