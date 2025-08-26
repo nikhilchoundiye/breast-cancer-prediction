@@ -1,0 +1,560 @@
+# views.py
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from django.utils.decorators import method_decorator
+from django.views import View
+from django.core.exceptions import ValidationError
+from django.db import transaction
+import json
+import hashlib
+from datetime import datetime, timedelta
+import logging
+import re
+
+# models.py (add these models)
+from django.db import models
+from django.contrib.auth.models import User
+
+class LabLicense(models.Model):
+    """Model for lab licenses"""
+    license_number = models.CharField(max_length=20, unique=True)
+    lab_name = models.CharField(max_length=200)
+    technician_name = models.CharField(max_length=100)
+    email = models.EmailField()
+    phone = models.CharField(max_length=15)
+    expiration_date = models.DateField()
+    is_active = models.BooleanField(default=True)
+    is_suspended = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Additional fields for better tracking
+    license_type = models.CharField(max_length=50, default='STANDARD')
+    department = models.CharField(max_length=100, blank=True)
+    supervisor_name = models.CharField(max_length=100, blank=True)
+    last_login = models.DateTimeField(null=True, blank=True)
+    login_count = models.IntegerField(default=0)
+    
+    class Meta:
+        db_table = 'lab_licenses'
+        verbose_name = 'Lab License'
+        verbose_name_plural = 'Lab Licenses'
+    
+    def __str__(self):
+        return f"{self.license_number} - {self.lab_name}"
+    
+    def is_valid(self):
+        """Check if license is valid"""
+        today = datetime.now().date()
+        return (self.is_active and 
+                not self.is_suspended and 
+                self.expiration_date >= today)
+
+class PredictionLog(models.Model):
+    """Model to log all predictions for audit trail"""
+    license = models.ForeignKey(LabLicense, on_delete=models.CASCADE)
+    patient_name = models.CharField(max_length=100)
+    patient_id = models.CharField(max_length=50, blank=True)
+    patient_age = models.IntegerField()
+    patient_gender = models.CharField(max_length=10)
+    
+    # Prediction results
+    prediction_label = models.CharField(max_length=50)
+    confidence_score = models.FloatField()
+    malignant_probability = models.FloatField()
+    benign_probability = models.FloatField()
+    predicted_stage = models.CharField(max_length=50, blank=True)
+    
+    # Additional clinical info
+    family_history = models.CharField(max_length=20, blank=True)
+    previous_cancer = models.CharField(max_length=20, blank=True)
+    biopsy_date = models.DateField(null=True, blank=True)
+    
+    # System info
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    
+    # Feature data (stored as JSON)
+    feature_data = models.JSONField()
+    
+    class Meta:
+        db_table = 'prediction_logs'
+        ordering = ['-timestamp']
+    
+    def __str__(self):
+        return f"{self.patient_name} - {self.timestamp.strftime('%Y-%m-%d %H:%M')}"
+
+class LoginAttempt(models.Model):
+    """Track login attempts for security"""
+    license_number = models.CharField(max_length=20)
+    ip_address = models.GenericIPAddressField()
+    success = models.BooleanField(default=False)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    error_message = models.CharField(max_length=200, blank=True)
+    
+    class Meta:
+        db_table = 'login_attempts'
+        ordering = ['-timestamp']
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+def get_client_ip(request):
+    """Get client IP address"""
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        ip = x_forwarded_for.split(',')[0]
+    else:
+        ip = request.META.get('REMOTE_ADDR')
+    return ip
+
+def validate_license_number(license_number):
+    """Validate license number format"""
+    if not license_number:
+        return False, "License number is required"
+    
+    # Remove common separators for validation
+    clean_license = license_number.replace('-', '').replace('_', '').replace(' ', '')
+    
+    if len(clean_license) < 6 or len(clean_license) > 15:
+        return False, "License number should be 6-15 characters long"
+    
+    if not re.match(r'^[A-Za-z0-9\-_]+$', license_number):
+        return False, "License number contains invalid characters"
+    
+    return True, ""
+
+def check_rate_limiting(ip_address, license_number):
+    """Check for rate limiting to prevent brute force attacks"""
+    # Check failed attempts in last 15 minutes
+    fifteen_min_ago = datetime.now() - timedelta(minutes=15)
+    recent_failures = LoginAttempt.objects.filter(
+        ip_address=ip_address,
+        success=False,
+        timestamp__gte=fifteen_min_ago
+    ).count()
+    
+    if recent_failures >= 5:
+        return False, "Too many failed attempts. Please try again in 15 minutes."
+    
+    return True, ""
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ValidateLicenseView(View):
+    """Enhanced license validation with better security and logging"""
+    
+    def post(self, request):
+        try:
+            # Parse request data
+            data = json.loads(request.body)
+            license_number = data.get('license_number', '').strip()
+            expiration_date_str = data.get('expiration_date', '')
+            
+            # Get client info for logging
+            ip_address = get_client_ip(request)
+            user_agent = request.META.get('HTTP_USER_AGENT', '')
+            
+            # Validate input format
+            is_valid_format, format_error = validate_license_number(license_number)
+            if not is_valid_format:
+                self.log_attempt(license_number, ip_address, False, format_error)
+                return JsonResponse({
+                    'status': 'error',
+                    'message': format_error
+                }, status=400)
+            
+            # Check rate limiting
+            rate_ok, rate_error = check_rate_limiting(ip_address, license_number)
+            if not rate_ok:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': rate_error
+                }, status=429)
+            
+            # Parse expiration date
+            try:
+                provided_expiration = datetime.strptime(expiration_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                self.log_attempt(license_number, ip_address, False, "Invalid date format")
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Invalid expiration date format'
+                }, status=400)
+            
+            # Look up license in database
+            try:
+                license_obj = LabLicense.objects.get(license_number=license_number)
+            except LabLicense.DoesNotExist:
+                self.log_attempt(license_number, ip_address, False, "License not found")
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Invalid license number'
+                }, status=401)
+            
+            # Validate license
+            if not license_obj.is_valid():
+                error_msg = "License expired" if license_obj.expiration_date < datetime.now().date() else "License suspended"
+                self.log_attempt(license_number, ip_address, False, error_msg)
+                return JsonResponse({
+                    'status': 'error',
+                    'message': error_msg
+                }, status=403)
+            
+            # Check expiration date match (for additional security)
+            if license_obj.expiration_date != provided_expiration:
+                self.log_attempt(license_number, ip_address, False, "Expiration date mismatch")
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'License details do not match our records'
+                }, status=401)
+            
+            # Update login tracking
+            with transaction.atomic():
+                license_obj.last_login = datetime.now()
+                license_obj.login_count += 1
+                license_obj.save()
+            
+            # Log successful attempt
+            self.log_attempt(license_number, ip_address, True, "Login successful")
+            
+            # Return success response
+            return JsonResponse({
+                'status': 'success',
+                'message': 'License verified successfully',
+                'data': {
+                    'lab_name': license_obj.lab_name,
+                    'technician_name': license_obj.technician_name,
+                    'license_type': license_obj.license_type,
+                    'department': license_obj.department,
+                    'expires_on': license_obj.expiration_date.strftime('%Y-%m-%d')
+                }
+            })
+            
+        except json.JSONDecodeError:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Invalid JSON data'
+            }, status=400)
+        
+        except Exception as e:
+            logger.error(f"License validation error: {str(e)}")
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Internal server error'
+            }, status=500)
+    
+    def log_attempt(self, license_number, ip_address, success, message):
+        """Log login attempt for security auditing"""
+        try:
+            LoginAttempt.objects.create(
+                license_number=license_number,
+                ip_address=ip_address,
+                success=success,
+                error_message=message if not success else ""
+            )
+        except Exception as e:
+            logger.error(f"Failed to log login attempt: {str(e)}")
+
+@method_decorator(csrf_exempt, name='dispatch')
+class LogPredictionView(View):
+    """Log prediction results for audit and analytics"""
+    
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            license_number = data.get('license_number')
+            patient_info = data.get('patient_info', {})
+            prediction_result = data.get('prediction_result', {})
+            
+            # Validate license exists
+            try:
+                license_obj = LabLicense.objects.get(license_number=license_number)
+            except LabLicense.DoesNotExist:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Invalid license'
+                }, status=401)
+            
+            # Create prediction log
+            prediction_log = PredictionLog.objects.create(
+                license=license_obj,
+                patient_name=patient_info.get('name', ''),
+                patient_id=patient_info.get('id', ''),
+                patient_age=patient_info.get('age', 0),
+                patient_gender=patient_info.get('gender', ''),
+                prediction_label=prediction_result.get('label', ''),
+                confidence_score=prediction_result.get('confidence', 0),
+                malignant_probability=prediction_result.get('malignant_prob', 0),
+                benign_probability=prediction_result.get('benign_prob', 0),
+                predicted_stage=prediction_result.get('stage', ''),
+                family_history=patient_info.get('family_history', ''),
+                previous_cancer=patient_info.get('previous_cancer', ''),
+                biopsy_date=patient_info.get('biopsy_date'),
+                ip_address=get_client_ip(request),
+                user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                feature_data=data.get('feature_data', {})
+            )
+            
+            return JsonResponse({
+                'status': 'success',
+                'log_id': prediction_log.id,
+                'message': 'Prediction logged successfully'
+            })
+            
+        except json.JSONDecodeError:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Invalid JSON data'
+            }, status=400)
+        
+        except Exception as e:
+            logger.error(f"Prediction logging error: {str(e)}")
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Failed to log prediction'
+            }, status=500)
+
+@method_decorator(csrf_exempt, name='dispatch')  
+class GetAnalyticsView(View):
+    """Get analytics for lab dashboard"""
+    
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            license_number = data.get('license_number')
+            
+            # Validate license
+            try:
+                license_obj = LabLicense.objects.get(license_number=license_number)
+            except LabLicense.DoesNotExist:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Invalid license'
+                }, status=401)
+            
+            # Get analytics data
+            today = datetime.now().date()
+            week_ago = today - timedelta(days=7)
+            month_ago = today - timedelta(days=30)
+            
+            # Today's stats
+            today_predictions = PredictionLog.objects.filter(
+                license=license_obj,
+                timestamp__date=today
+            )
+            
+            # Week stats
+            week_predictions = PredictionLog.objects.filter(
+                license=license_obj,
+                timestamp__date__gte=week_ago
+            )
+            
+            # Month stats
+            month_predictions = PredictionLog.objects.filter(
+                license=license_obj,
+                timestamp__date__gte=month_ago
+            )
+            
+            # Calculate malignant rate
+            month_malignant = month_predictions.filter(
+                prediction_label__icontains='Malignant'
+            ).count()
+            
+            analytics = {
+                'today_count': today_predictions.count(),
+                'week_count': week_predictions.count(),
+                'month_count': month_predictions.count(),
+                'malignant_rate': (month_malignant / month_predictions.count() * 100) if month_predictions.count() > 0 else 0,
+                'last_login': license_obj.last_login.isoformat() if license_obj.last_login else None,
+                'total_logins': license_obj.login_count
+            }
+            
+            return JsonResponse({
+                'status': 'success',
+                'analytics': analytics
+            })
+            
+        except Exception as e:
+            logger.error(f"Analytics error: {str(e)}")
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Failed to get analytics'
+            }, status=500)
+
+# urls.py additions
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('api/validate_license/', views.ValidateLicenseView.as_view(), name='validate_license'),
+    path('api/log_prediction/', views.LogPredictionView.as_view(), name='log_prediction'),
+    path('api/get_analytics/', views.GetAnalyticsView.as_view(), name='get_analytics'),
+]
+
+# admin.py - for Django admin interface
+from django.contrib import admin
+from .models import LabLicense, PredictionLog, LoginAttempt
+
+@admin.register(LabLicense)
+class LabLicenseAdmin(admin.ModelAdmin):
+    list_display = ('license_number', 'lab_name', 'technician_name', 'expiration_date', 'is_active', 'last_login')
+    list_filter = ('is_active', 'is_suspended', 'license_type', 'expiration_date')
+    search_fields = ('license_number', 'lab_name', 'technician_name', 'email')
+    readonly_fields = ('created_at', 'updated_at', 'last_login', 'login_count')
+    
+    fieldsets = (
+        ('License Information', {
+            'fields': ('license_number', 'license_type', 'expiration_date', 'is_active', 'is_suspended')
+        }),
+        ('Lab Details', {
+            'fields': ('lab_name', 'department', 'technician_name', 'supervisor_name')
+        }),
+        ('Contact Information', {
+            'fields': ('email', 'phone')
+        }),
+        ('System Information', {
+            'fields': ('last_login', 'login_count', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        })
+    )
+
+@admin.register(PredictionLog)
+class PredictionLogAdmin(admin.ModelAdmin):
+    list_display = ('patient_name', 'license', 'prediction_label', 'confidence_score', 'timestamp')
+    list_filter = ('prediction_label', 'predicted_stage', 'patient_gender', 'timestamp')
+    search_fields = ('patient_name', 'patient_id', 'license__license_number', 'license__lab_name')
+    readonly_fields = ('timestamp', 'ip_address')
+    
+    fieldsets = (
+        ('Patient Information', {
+            'fields': ('patient_name', 'patient_id', 'patient_age', 'patient_gender')
+        }),
+        ('Clinical History', {
+            'fields': ('family_history', 'previous_cancer', 'biopsy_date')
+        }),
+        ('Prediction Results', {
+            'fields': ('prediction_label', 'confidence_score', 'malignant_probability', 'benign_probability', 'predicted_stage')
+        }),
+        ('Lab Information', {
+            'fields': ('license',)
+        }),
+        ('System Information', {
+            'fields': ('timestamp', 'ip_address', 'user_agent', 'feature_data'),
+            'classes': ('collapse',)
+        })
+    )
+
+@admin.register(LoginAttempt)
+class LoginAttemptAdmin(admin.ModelAdmin):
+    list_display = ('license_number', 'ip_address', 'success', 'timestamp')
+    list_filter = ('success', 'timestamp')
+    search_fields = ('license_number', 'ip_address')
+    readonly_fields = ('timestamp',)
+
+# settings.py additions
+"""
+Add these to your Django settings.py:
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',  # or postgresql/mysql
+        'NAME': BASE_DIR / 'cancer_prediction.db',
+    }
+}
+
+# Logging configuration
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': 'cancer_prediction.log',
+        },
+    },
+    'loggers': {
+        'cancer_prediction': {
+            'handlers': ['file'],
+            'level': 'INFO',
+            'propagate': True,
+        },
+    },
+}
+
+# CORS settings (install django-cors-headers)
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:8501",  # Streamlit default port
+    "http://127.0.0.1:8501",
+]
+
+CORS_ALLOW_CREDENTIALS = True
+"""
+
+# management/commands/create_sample_licenses.py
+"""
+Create this file to populate sample license data:
+
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+from datetime import timedelta
+from cancer_prediction.models import LabLicense
+
+class Command(BaseCommand):
+    help = 'Create sample lab licenses for testing'
+    
+    def handle(self, *args, **options):
+        sample_licenses = [
+            {
+                'license_number': 'LAB001-2024',
+                'lab_name': 'City Medical Center Lab',
+                'technician_name': 'Dr. Sarah Johnson',
+                'email': 'sarah.johnson@citymedical.com',
+                'phone': '+1-555-0101',
+                'expiration_date': timezone.now().date() + timedelta(days=365),
+                'license_type': 'SENIOR',
+                'department': 'Oncology',
+                'supervisor_name': 'Dr. Michael Chen'
+            },
+            {
+                'license_number': 'LAB002-2024',
+                'lab_name': 'Regional Diagnostic Center',
+                'technician_name': 'Dr. Robert Smith',
+                'email': 'robert.smith@regional.com',
+                'phone': '+1-555-0102',
+                'expiration_date': timezone.now().date() + timedelta(days=365),
+                'license_type': 'STANDARD',
+                'department': 'Pathology'
+            },
+            {
+                'license_number': 'TEST123',
+                'lab_name': 'Testing Laboratory',
+                'technician_name': 'Test User',
+                'email': 'test@example.com',
+                'phone': '+1-555-0000',
+                'expiration_date': timezone.now().date() + timedelta(days=30),
+                'license_type': 'DEMO'
+            }
+        ]
+        
+        for license_data in sample_licenses:
+            license_obj, created = LabLicense.objects.get_or_create(
+                license_number=license_data['license_number'],
+                defaults=license_data
+            )
+            
+            if created:
+                self.stdout.write(
+                    self.style.SUCCESS(
+                        f'Created license: {license_obj.license_number}'
+                    )
+                )
+            else:
+                self.stdout.write(
+                    f'License already exists: {license_obj.license_number}'
+                )
+
+# Run with: python manage.py create_sample_licenses
+"""
